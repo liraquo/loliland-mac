@@ -6,17 +6,26 @@ umask 022
 die() { printf '\nОшибка: %s\n' "$*" >&2; exit 1; }
 ROOT="$(cd -- "$(dirname -- "$0")" && pwd -P)"
 [[ "$(uname -s)" == Darwin ]] || die 'Этот установщик предназначен для macOS.'
-[[ $# == 0 ]] || die 'Запуск: bash install-v2.sh'
+[[ $# == 0 ]] || die 'Запуск: bash install-loliland.sh'
 APP="$ROOT/LoliLand.app"
-[[ ! -e "$APP" ]] || die 'LoliLand.app уже существует. Для новой установки используйте отдельную папку. Существующее приложение не изменено.'
+ID='local.loliland.launcher'
 for tool in curl tar unzip sips shasum plutil; do
   command -v "$tool" >/dev/null || die "Не найдена системная утилита: $tool"
 done
-case "$(uname -m)" in
-  arm64) ARCH=aarch64 ;;
-  x86_64) ARCH=x64 ;;
-  *) die 'Неизвестная архитектура Mac.' ;;
-esac
+# Replace only an app this script built, and never while it is running.
+check_old_app() {
+  [[ -e "$APP" ]] || return 0
+  [[ "$(plutil -extract CFBundleIdentifier raw -o - "$APP/Contents/Info.plist" 2>/dev/null)" == "$ID" ]] \
+    || die "$APP создан не этим установщиком. Переместите или удалите его вручную."
+  local procs; procs="$(ps -axo command=)"
+  [[ "$procs" != *"$APP/Contents/"* ]] || die 'LoliLand сейчас запущен. Закройте его и повторите установку.'
+}
+check_old_app
+# uname -m reports x86_64 under Rosetta, so ask the hardware.
+if [[ "$(sysctl -n hw.optional.arm64 2>/dev/null)" == 1 ]]; then ARCH=aarch64
+elif [[ "$(uname -m)" == x86_64 ]]; then ARCH=x64
+else die 'Неизвестная архитектура Mac.'
+fi
 
 # Work on the same filesystem; publish only a fully verified application.
 WORK="$(mktemp -d "$ROOT/.loliland-install.XXXXXX")"
@@ -46,7 +55,7 @@ download "$SOURCE/api/updater/load/launcher" "$RES/launcher.jar" \
   || die 'Не удалось скачать launcher.jar. Проверьте сеть и доступность сервера.'
 [[ "$(stat -f %z "$RES/launcher.jar")" == "$SIZE" ]] || die 'Размер launcher.jar не совпадает с манифестом.'
 unzip -tq "$RES/launcher.jar" >/dev/null || die 'Архив launcher.jar повреждён.'
-unzip -p "$RES/launcher.jar" META-INF/MANIFEST.MF | tr -d '\r' | grep -qx 'Main-Class: loliland.launcher.app.Main' \
+unzip -p "$RES/launcher.jar" META-INF/MANIFEST.MF | tr -d '\r' | grep -x 'Main-Class: loliland.launcher.app.Main' >/dev/null \
   || die 'В JAR не найден основной класс лаунчера LoliLand.'
 
 printf '2/3 Скачиваю JetBrains Runtime с JCEF для macOS (%s)…\n' "$ARCH"
@@ -60,17 +69,17 @@ ACTUAL="$(shasum -a 512 "$WORK/$RUNTIME.tar.gz" | awk '{print $1}')"
 [[ "$ACTUAL" == "$EXPECTED" ]] || die 'SHA-512 архива Java не совпадает. Установка остановлена.'
 tar -xzf "$WORK/$RUNTIME.tar.gz" -C "$RES/runtimes"
 JAVA_HOME_LOCAL="$RES/runtimes/$RUNTIME/Contents/Home"
-"$JAVA_HOME_LOCAL/bin/java" -version
+"$JAVA_HOME_LOCAL/bin/java" -version >/dev/null 2>&1 || die 'Скачанная Java не запускается.'
 "$JAVA_HOME_LOCAL/bin/java" --list-modules | grep -E '^jcef(@|$)' >/dev/null || die 'В Java отсутствует JCEF.'
 
 printf '3/3 Создаю переносимое LoliLand.app с иконкой…\n'
-cat > "$BUNDLE/Contents/Info.plist" <<'PLIST'
+cat > "$BUNDLE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>CFBundleName</key><string>LoliLand</string>
 <key>CFBundleDisplayName</key><string>LoliLand</string>
-<key>CFBundleIdentifier</key><string>local.loliland.launcher</string>
+<key>CFBundleIdentifier</key><string>$ID</string>
 <key>CFBundleVersion</key><string>1</string>
 <key>CFBundleShortVersionString</key><string>1.0</string>
 <key>CFBundlePackageType</key><string>APPL</string>
@@ -88,12 +97,15 @@ RUNTIME="$(< "$RES/runtime-name.txt")"
 export JAVA_HOME="$RES/runtimes/$RUNTIME/Contents/Home"
 export PATH="$JAVA_HOME/bin:$PATH"
 DATA="$HOME/Library/Application Support/LoliLand"
+LOG="$DATA/macos-app.log"
 mkdir -p "$DATA"
 cd -- "$DATA"
+# Keep only the current and the previous launch.
+[[ ! -f "$LOG" ]] || mv -f -- "$LOG" "$LOG.1"
 exec "$JAVA_HOME/bin/java" \
   -Xdock:name=LoliLand "-Xdock:icon=$RES/LoliLand.icns" \
   --add-exports=java.desktop/com.apple.eawt=ALL-UNNAMED \
-  -jar "$RES/launcher.jar" "$@" >> "$DATA/macos-app.log" 2>&1
+  -jar "$RES/launcher.jar" "$@" > "$LOG" 2>&1
 LAUNCH
 chmod +x "$BUNDLE/Contents/MacOS/LoliLand"
 unzip -p "$RES/launcher.jar" loliland/application/public/favicon.ico > "$WORK/favicon.ico"
@@ -104,9 +116,14 @@ plutil -lint "$BUNDLE/Contents/Info.plist" >/dev/null
 printf 'Launcher source: %s/api/updater/load/launcher\nRuntime source: %s\nRuntime SHA-512: %s\n' \
   "$SOURCE" "$URL" "$ACTUAL" > "$RES/install-info.txt"
 shasum -a 256 "$RES/launcher.jar" | awk '{print "Launcher SHA-256: " $1}' >> "$RES/install-info.txt"
-[[ ! -e "$APP" ]] || die 'LoliLand.app появился во время установки; существующее приложение сохранено.'
-mv -- "$BUNDLE" "$APP"
+check_old_app
+# The old app goes into WORK, so the EXIT trap deletes it after a successful swap.
+if [[ -e "$APP" ]]; then
+  mv -- "$APP" "$WORK/old.app"
+  printf 'Заменяю предыдущую версию LoliLand.app…\n'
+fi
+mv -- "$BUNDLE" "$APP" || { mv -- "$WORK/old.app" "$APP" 2>/dev/null; die 'Не удалось установить новое приложение; старое восстановлено.'; }
 printf '\nГотово: %s\n' "$APP"
 printf 'Откройте приложение двойным щелчком. Можно перенести его в «Программы» или закрепить в Dock.\n'
-printf 'Java и лаунчер находятся внутри приложения. Исходная папка больше не нужна.\n'
+printf 'Java и лаунчер находятся внутри приложения. Для обновления запустите этот скрипт ещё раз.\n'
 printf 'Для запуска Minecraft войдите в аккаунт и выберите сборку в лаунчере.\n'
