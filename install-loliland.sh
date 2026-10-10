@@ -115,10 +115,15 @@ mkdir -p "$DATA"
 cd -- "$DATA"
 # Keep only the current and the previous launch.
 [[ ! -f "$LOG" ]] || mv -f -- "$LOG" "$LOG.1"
-exec "$JAVA_HOME/bin/java" \
+STATUS=0
+"$JAVA_HOME/bin/java" \
   -Xdock:name=LoliLand "-Xdock:icon=$RES/LoliLand.icns" \
   --add-exports=java.desktop/com.apple.eawt=ALL-UNNAMED \
-  -jar "$RES/launcher.jar" "$@" > "$LOG" 2>&1
+  -jar "$RES/launcher.jar" "$@" > "$LOG" 2>&1 || STATUS=$?
+# The launcher exits right after spawning the game. If the app ends too, macOS can
+# terminate a slowly starting game (first run), so stay alive until the game exits.
+while pgrep -qf 'loliland\.client\.uuid='; do sleep 2; done
+exit $STATUS
 LAUNCH
 chmod +x "$BUNDLE/Contents/MacOS/LoliLand"
 unzip -p "$RES/launcher.jar" loliland/application/public/favicon.ico > "$WORK/favicon.ico"
