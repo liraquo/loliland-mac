@@ -3,7 +3,10 @@
 set -euo pipefail
 umask 022
 
-die() { printf '\nОшибка: %s\n' "$*" >&2; exit 1; }
+if [[ -t 1 ]]; then B=$'\033[1m' G=$'\033[32m' R=$'\033[31m' N=$'\033[0m'; else B='' G='' R='' N=''; fi
+die() { printf '\n%sОшибка:%s %s\n' "$R$B" "$N" "$*" >&2; exit 1; }
+step() { printf '\n%s[%s/3] %s%s\n' "$B" "$1" "$2" "$N"; }
+ok() { printf '  %s✓%s %s\n' "$G" "$N" "$*"; }
 ROOT="$(cd -- "$(dirname -- "$0")" && pwd -P)"
 [[ "$(uname -s)" == Darwin ]] || die 'Этот установщик предназначен для macOS.'
 [[ $# == 0 ]] || die 'Запуск: bash install-loliland.sh'
@@ -12,11 +15,9 @@ ID='local.loliland.launcher'
 for tool in curl tar unzip sips shasum plutil; do
   command -v "$tool" >/dev/null || die "Не найдена системная утилита: $tool"
 done
-# Replace only an app this script built, and never while it is running.
+# Never replace the app while it is running.
 check_old_app() {
   [[ -e "$APP" ]] || return 0
-  [[ "$(plutil -extract CFBundleIdentifier raw -o - "$APP/Contents/Info.plist" 2>/dev/null)" == "$ID" ]] \
-    || die "$APP создан не этим установщиком. Переместите или удалите его вручную."
   local procs; procs="$(ps -axo command=)"
   [[ "$procs" != *"$APP/Contents/"* ]] || die 'LoliLand сейчас запущен. Закройте его и повторите установку.'
 }
@@ -33,9 +34,10 @@ cleanup() { [[ -z "${WORK:-}" ]] || rm -rf -- "$WORK"; }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+# download URL FILE [--progress-bar]; small files download silently.
 download() {
   curl --fail --location --proto '=https' --proto-redir '=https' \
-    --connect-timeout 10 --max-time 300 --retry 2 --show-error \
+    --connect-timeout 10 --max-time 300 --retry 2 --show-error "${3:---silent}" \
     --output "$2" "$1"
 }
 
@@ -45,34 +47,45 @@ SOURCE='https://klauncher.loliland.pro'
 BUNDLE="$WORK/LoliLand.app"
 RES="$BUNDLE/Contents/Resources"
 mkdir -p "$BUNDLE/Contents/MacOS" "$RES/runtimes"
-printf '1/3 Скачиваю launcher.jar с сервера LoliLand…\n'
+printf '%sУстановщик LoliLand для macOS%s\n' "$B" "$N"
+step 1 'Лаунчер LoliLand'
 download "$SOURCE/api/updater/win64" "$WORK/manifest.json" \
   || die 'Не удалось получить манифест LoliLand. Проверьте сеть и доступность сервера.'
 SIZE="$(plutil -extract launcher.size raw -o - "$WORK/manifest.json" 2>/dev/null)" \
   || die 'Сервер вернул некорректный манифест лаунчера.'
 [[ "$SIZE" =~ ^[0-9]+$ && "$SIZE" -gt 0 ]] || die 'Некорректный размер лаунчера в манифесте.'
-download "$SOURCE/api/updater/load/launcher" "$RES/launcher.jar" \
+ok 'Манифест получен'
+printf '  Скачиваю launcher.jar (%s МБ)…\n' "$((SIZE / 1048576))"
+download "$SOURCE/api/updater/load/launcher" "$RES/launcher.jar" --progress-bar \
   || die 'Не удалось скачать launcher.jar. Проверьте сеть и доступность сервера.'
 [[ "$(stat -f %z "$RES/launcher.jar")" == "$SIZE" ]] || die 'Размер launcher.jar не совпадает с манифестом.'
+ok 'Размер совпадает с манифестом'
 unzip -tq "$RES/launcher.jar" >/dev/null || die 'Архив launcher.jar повреждён.'
 unzip -p "$RES/launcher.jar" META-INF/MANIFEST.MF | tr -d '\r' | grep -x 'Main-Class: loliland.launcher.app.Main' >/dev/null \
   || die 'В JAR не найден основной класс лаунчера LoliLand.'
+ok 'Архив цел, лаунчер на месте'
 
-printf '2/3 Скачиваю JetBrains Runtime с JCEF для macOS (%s)…\n' "$ARCH"
+step 2 "Java (JetBrains Runtime с JCEF, $ARCH)"
 RUNTIME="jbr_jcef-17.0.11-osx-$ARCH-b1312.2"
 URL="https://cache-redirector.jetbrains.com/intellij-jbr/$RUNTIME.tar.gz"
-download "$URL" "$WORK/$RUNTIME.tar.gz"
-download "$URL.checksum" "$WORK/checksum"
+printf '  Скачиваю %s…\n' "$RUNTIME"
+download "$URL" "$WORK/$RUNTIME.tar.gz" --progress-bar \
+  || die 'Не удалось скачать Java с сервера JetBrains. Проверьте сеть.'
+download "$URL.checksum" "$WORK/checksum" \
+  || die 'Не удалось скачать контрольную сумму Java.'
 EXPECTED="$(awk 'NR == 1 {print $1}' "$WORK/checksum")"
 [[ "$EXPECTED" =~ ^[0-9a-fA-F]{128}$ ]] || die 'Некорректная контрольная сумма JetBrains.'
 ACTUAL="$(shasum -a 512 "$WORK/$RUNTIME.tar.gz" | awk '{print $1}')"
 [[ "$ACTUAL" == "$EXPECTED" ]] || die 'SHA-512 архива Java не совпадает. Установка остановлена.'
+ok 'SHA-512 совпадает с JetBrains'
+printf '  Распаковываю…\n'
 tar -xzf "$WORK/$RUNTIME.tar.gz" -C "$RES/runtimes"
 JAVA_HOME_LOCAL="$RES/runtimes/$RUNTIME/Contents/Home"
 "$JAVA_HOME_LOCAL/bin/java" -version >/dev/null 2>&1 || die 'Скачанная Java не запускается.'
 "$JAVA_HOME_LOCAL/bin/java" --list-modules | grep -E '^jcef(@|$)' >/dev/null || die 'В Java отсутствует JCEF.'
+ok 'Java запускается, JCEF на месте'
 
-printf '3/3 Создаю переносимое LoliLand.app с иконкой…\n'
+step 3 'Сборка LoliLand.app'
 cat > "$BUNDLE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -116,14 +129,17 @@ plutil -lint "$BUNDLE/Contents/Info.plist" >/dev/null
 printf 'Launcher source: %s/api/updater/load/launcher\nRuntime source: %s\nRuntime SHA-512: %s\n' \
   "$SOURCE" "$URL" "$ACTUAL" > "$RES/install-info.txt"
 shasum -a 256 "$RES/launcher.jar" | awk '{print "Launcher SHA-256: " $1}' >> "$RES/install-info.txt"
+ok 'Приложение собрано'
 check_old_app
 # The old app goes into WORK, so the EXIT trap deletes it after a successful swap.
 if [[ -e "$APP" ]]; then
   mv -- "$APP" "$WORK/old.app"
-  printf 'Заменяю предыдущую версию LoliLand.app…\n'
+  ok 'Предыдущая версия LoliLand.app заменена'
 fi
 mv -- "$BUNDLE" "$APP" || { mv -- "$WORK/old.app" "$APP" 2>/dev/null; die 'Не удалось установить новое приложение; старое восстановлено.'; }
-printf '\nГотово: %s\n' "$APP"
-printf 'Откройте приложение двойным щелчком. Можно перенести его в «Программы» или закрепить в Dock.\n'
-printf 'Java и лаунчер находятся внутри приложения. Для обновления запустите этот скрипт ещё раз.\n'
-printf 'Для запуска Minecraft войдите в аккаунт и выберите сборку в лаунчере.\n'
+
+printf '\n%s%s✓ Готово:%s %s\n\n' "$G" "$B" "$N" "$APP"
+printf '%sОсталось одно действие:%s перетащите LoliLand.app в папку «Программы»\n' "$B" "$N"
+printf '(в боковой панели Finder). Тогда LoliLand появится в Launchpad и Spotlight,\n'
+printf 'и его можно будет закрепить в Dock. Окно Finder с приложением сейчас откроется.\n\n'
+open -R "$APP" 2>/dev/null || true
